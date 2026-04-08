@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"runtime/debug"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -33,8 +34,11 @@ type AppConfig struct {
 }
 
 type Application struct {
-	waf   coraza.WAF
-	cache cache.ExpiringCache
+	waf     coraza.WAF
+	cache   cache.ExpiringCache
+	asyncWg sync.WaitGroup
+	asyncMu sync.Mutex
+	draining bool
 
 	AppConfig
 }
@@ -240,6 +244,7 @@ type applicationResponse struct {
 	Headers       []byte
 	Body          []byte
 	ExportRuleIDs bool
+	DetectOnly    bool
 }
 
 func (a *Application) HandleResponse(ctx context.Context, writer *encoding.ActionWriter, message *encoding.Message) (err error) {
@@ -248,12 +253,20 @@ func (a *Application) HandleResponse(ctx context.Context, writer *encoding.Actio
 	}
 
 	k := encoding.AcquireKVEntry()
-	// run defer via anonymous function to not directly evaluate the arguments.
 	defer func() {
 		encoding.ReleaseKVEntry(k)
 	}()
 
 	var res applicationResponse
+	// borrowed tracks KV entries whose byte slices are referenced by res.
+	// Released when the function returns (or transferred to the goroutine
+	// in detect-only mode).
+	var borrowed []*encoding.KVEntry
+	defer func() {
+		for _, entry := range borrowed {
+			encoding.ReleaseKVEntry(entry)
+		}
+	}()
 	for message.KV.Next(k) {
 		switch name := string(k.NameBytes()); name {
 		case "id":
@@ -263,29 +276,19 @@ func (a *Application) HandleResponse(ctx context.Context, writer *encoding.Actio
 		case "status":
 			res.Status = k.ValueInt()
 		case "headers":
-			// make a copy of the pointer and add a defer in case there is another entry
 			currK := k
-			// run defer via anonymous function to not directly evaluate the arguments.
-			defer func() {
-				encoding.ReleaseKVEntry(currK)
-			}()
-
+			borrowed = append(borrowed, currK)
 			res.Headers = currK.ValueBytes()
-			// acquire a new kv entry to continue reading other message values.
 			k = encoding.AcquireKVEntry()
 		case "body":
-			// make a copy of the pointer and add a defer in case there is another entry
 			currK := k
-			// run defer via anonymous function to not directly evaluate the arguments.
-			defer func() {
-				encoding.ReleaseKVEntry(currK)
-			}()
-
+			borrowed = append(borrowed, currK)
 			res.Body = currK.ValueBytes()
-			// acquire a new kv entry to continue reading other message values.
 			k = encoding.AcquireKVEntry()
 		case "exportRuleIDs":
 			res.ExportRuleIDs = k.ValueBool()
+		case "detect-only":
+			res.DetectOnly = k.ValueBool()
 		default:
 			a.Logger.Debug().Str("name", name).Msg("unknown kv entry")
 		}
@@ -307,43 +310,93 @@ func (a *Application) HandleResponse(ctx context.Context, writer *encoding.Actio
 	}
 	tx := t.tx
 
-	defer func() {
+	process := func(headers, body []byte) error {
+		if tx.IsRuleEngineOff() {
+			return nil
+		}
+
+		if err := readHeaders(headers, tx.AddResponseHeader, nil); err != nil {
+			return fmt.Errorf("reading headers: %v", err)
+		}
+
+		if it := tx.ProcessResponseHeaders(int(res.Status), "HTTP/"+res.Version); it != nil {
+			return ErrInterrupted{it}
+		}
+
+		switch it, _, err := tx.WriteResponseBody(body); {
+		case err != nil:
+			return err
+		case it != nil:
+			return ErrInterrupted{it}
+		}
+
+		switch it, err := tx.ProcessResponseBody(); {
+		case err != nil:
+			return err
+		case it != nil:
+			return ErrInterrupted{it}
+		}
+
+		return nil
+	}
+
+	closeTx := func() {
 		tx.ProcessLogging()
 		if err := tx.Close(); err != nil {
 			a.Logger.Error().Str("tx", tx.ID()).Err(err).Msg("failed to close transaction")
 		}
-	}()
+	}
 
+	// Detection-only mode: deep copy borrowed byte slices (the SPOE frame
+	// buffer is reused after HandleSPOE returns) and evaluate in background.
+	if res.DetectOnly {
+		a.asyncMu.Lock()
+		if a.draining {
+			a.asyncMu.Unlock()
+			// Shutdown in progress; fall back to synchronous evaluation.
+			defer closeTx()
+			return process(res.Headers, res.Body)
+		}
+		a.asyncWg.Add(1)
+		a.asyncMu.Unlock()
+
+		headers := make([]byte, len(res.Headers))
+		copy(headers, res.Headers)
+		body := make([]byte, len(res.Body))
+		copy(body, res.Body)
+
+		go func() {
+			defer a.asyncWg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					a.Logger.Error().
+						Str("tx", tx.ID()).
+						Interface("panic", r).
+						Bytes("stack", debug.Stack()).
+						Msg("detect-only: panic in background evaluation")
+				}
+			}()
+			defer closeTx()
+
+			if err := process(headers, body); err != nil {
+				a.Logger.Debug().Str("tx", tx.ID()).Err(err).Msg("detect-only: evaluation error")
+			}
+		}()
+		return nil
+	}
+
+	defer closeTx()
 	defer exportWAFMetrics(writer, tx, res.ExportRuleIDs)
+	return process(res.Headers, res.Body)
+}
 
-	if tx.IsRuleEngineOff() {
-		goto exit
-	}
-
-	if err := readHeaders(res.Headers, tx.AddResponseHeader, nil); err != nil {
-		return fmt.Errorf("reading headers: %v", err)
-	}
-
-	if it := tx.ProcessResponseHeaders(int(res.Status), "HTTP/"+res.Version); it != nil {
-		return ErrInterrupted{it}
-	}
-
-	switch it, _, err := tx.WriteResponseBody(res.Body); {
-	case err != nil:
-		return err
-	case it != nil:
-		return ErrInterrupted{it}
-	}
-
-	switch it, err := tx.ProcessResponseBody(); {
-	case err != nil:
-		return err
-	case it != nil:
-		return ErrInterrupted{it}
-	}
-
-exit:
-	return nil
+// DrainDetectOnly sets the draining flag to refuse new background work
+// and blocks until all in-flight detect-only evaluations complete.
+func (a *Application) DrainDetectOnly() {
+	a.asyncMu.Lock()
+	a.draining = true
+	a.asyncMu.Unlock()
+	a.asyncWg.Wait()
 }
 
 func (a AppConfig) NewApplication() (*Application, error) {
